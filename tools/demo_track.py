@@ -16,13 +16,16 @@ from yolox.data.data_augment import ValTransform
 from yolox.data.datasets import COCO_CLASSES
 
 IMAGE_EXT = [".jpg", ".jpeg", ".webp", ".bmp", ".png"]
-# Example:
-# python tools/demo_track.py video \
-#   -f exps/example/coco/yolox_x.py \
-#   --ckpt pretrained/yolox_x.pth \
-#   --path videos/test1.mp4 \
-#   --save_result \
-#   --device gpu
+
+"""""
+Example command:
+python tools/demo_track.py video \
+  -f exps/example/coco/yolox_x.py \
+  --ckpt pretrained/yolox_x.pth \
+  --path videos/test1.mp4 \
+  --save_result \
+  --device gpu
+"""""
 
 
 def make_parser():
