@@ -129,6 +129,28 @@ def embedding_distance(tracks, detections, metric='cosine'):
     return cost_matrix
 
 
+def center_distance(atracks, btracks):
+    """
+    Compute pairwise center L2 distance.
+    :type atracks: list[STrack] | np.ndarray (tlbr)
+    :type btracks: list[STrack] | np.ndarray (tlbr)
+    :rtype cost_matrix np.ndarray
+    """
+    if (len(atracks) > 0 and isinstance(atracks[0], np.ndarray)) or (len(btracks) > 0 and isinstance(btracks[0], np.ndarray)):
+        atlbrs = atracks
+        btlbrs = btracks
+        a_centers = np.stack([(atlbrs[:, 0] + atlbrs[:, 2]) * 0.5, (atlbrs[:, 1] + atlbrs[:, 3]) * 0.5], axis=1)
+        b_centers = np.stack([(btlbrs[:, 0] + btlbrs[:, 2]) * 0.5, (btlbrs[:, 1] + btlbrs[:, 3]) * 0.5], axis=1)
+    else:
+        if len(atracks) == 0 or len(btracks) == 0:
+            return np.zeros((len(atracks), len(btracks)), dtype=float)
+        a_tlwh = np.asarray([t.tlwh for t in atracks], dtype=float)
+        b_tlwh = np.asarray([t.tlwh for t in btracks], dtype=float)
+        a_centers = np.stack([a_tlwh[:, 0] + a_tlwh[:, 2] * 0.5, a_tlwh[:, 1] + a_tlwh[:, 3] * 0.5], axis=1)
+        b_centers = np.stack([b_tlwh[:, 0] + b_tlwh[:, 2] * 0.5, b_tlwh[:, 1] + b_tlwh[:, 3] * 0.5], axis=1)
+    return cdist(a_centers, b_centers, metric="euclidean")
+
+
 def gate_cost_matrix(kf, cost_matrix, tracks, detections, only_position=False):
     if cost_matrix.size == 0:
         return cost_matrix

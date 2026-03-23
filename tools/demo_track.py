@@ -10,6 +10,7 @@ from yolox.exp import get_exp
 from yolox.utils import fuse_model, get_model_info, postprocess
 from yolox.utils.visualize import plot_tracking
 from yolox.tracker.byte_tracker import BYTETracker
+from yolox.tracker.fastreid_extractor import FastReIDExtractor
 from yolox.tracking_utils.timer import Timer
 
 from yolox.data.data_augment import ValTransform
@@ -17,15 +18,19 @@ from yolox.data.datasets import COCO_CLASSES
 
 IMAGE_EXT = [".jpg", ".jpeg", ".webp", ".bmp", ".png"]
 
-"""""
+"""
 Example command:
+PYTHONPATH=/home/yuhu100/文档/MRT_HiWi/ByteTrack/ByteTrack/fast-reid:$PYTHONPATH \
 python tools/demo_track.py video \
   -f exps/example/coco/yolox_x.py \
   --ckpt pretrained/yolox_x.pth \
-  --path videos/test1.mp4 \
+  --path videos/test2.mp4 \
   --save_result \
-  --device gpu
-"""""
+  --device gpu \
+  --reid \
+  --reid_config /home/yuhu100/文档/MRT_HiWi/ByteTrack/ByteTrack/fast-reid/configs/Market1501/bagtricks_R50.yml \
+  --reid_weights /home/yuhu100/文档/MRT_HiWi/ByteTrack/ByteTrack/fast-reid/pretrained/market_bot_R50.pth
+"""
 
 
 def make_parser():
@@ -63,7 +68,7 @@ def make_parser():
         help="device to run our model, can either be cpu or gpu",
     )
     parser.add_argument("--conf", default=0.05, type=float, help="test conf")
-    parser.add_argument("--nms", default=None, type=float, help="test nms threshold")
+    parser.add_argument("--nms", default=0.8, type=float, help="test nms threshold")
     parser.add_argument("--tsize", default=None, type=int, help="test img size")
     parser.add_argument("--fps", default=30, type=int, help="frame rate (fps)")
     parser.add_argument(
@@ -97,13 +102,19 @@ def make_parser():
     # tracking args
     parser.add_argument("--track_thresh", type=float, default=0.02, help="tracking confidence threshold")
     parser.add_argument("--track_buffer", type=int, default=30, help="the frames for keep lost tracks")
-    parser.add_argument("--match_thresh", type=float, default=0.8, help="matching threshold for tracking")
+    parser.add_argument("--match_thresh", type=float, default=0.7, help="matching threshold for tracking")
+    parser.add_argument("--center_thresh", type=float, default=200.0, help="center distance gating threshold (pixels); <=0 disables")
     parser.add_argument(
         "--aspect_ratio_thresh", type=float, default=100.0,
         help="threshold for filtering out boxes of which aspect ratio are above the given value."
     )
     parser.add_argument('--min_box_area', type=float, default=0, help='filter out tiny boxes')
     parser.add_argument("--mot20", dest="mot20", default=False, action="store_true", help="test mot20.")
+    parser.add_argument("--reid", action="store_true", help="enable FastReID features for association")
+    parser.add_argument("--reid_config", type=str, default="", help="FastReID config file")
+    parser.add_argument("--reid_weights", type=str, default="", help="FastReID model weights")
+    parser.add_argument("--reid_batch", type=int, default=32, help="FastReID batch size")
+    parser.add_argument("--reid_device", type=str, default="gpu", help="FastReID device: cpu/gpu")
     return parser
 
 
@@ -129,6 +140,18 @@ def write_results(filename, results):
                 line = save_format.format(frame=frame_id, id=track_id, x1=round(x1, 1), y1=round(y1, 1), w=round(w, 1), h=round(h, 1), s=round(score, 2))
                 f.write(line)
     logger.info('save results to {}'.format(filename))
+
+
+def filter_to_first_n_coco_classes(detections, n=8):
+    """Keep only detections whose COCO class id is in [0, n)."""
+    if detections is None:
+        return None
+    keep_mask = detections[:, 6] < n
+    filtered = detections[keep_mask]
+    if filtered.shape[0] == 0:
+        return None
+    return filtered
+
 
 class OfficialPredictor(object):
     def __init__(
@@ -191,12 +214,18 @@ class OfficialPredictor(object):
             outputs = self.model(img)
             if self.decoder is not None:
                 outputs = self.decoder(outputs, dtype=outputs.type())
-            outputs = postprocess(outputs, self.num_classes, self.confthre,self.nmsthre)
+            outputs = postprocess(
+                outputs,
+                self.num_classes,
+                self.confthre,
+                self.nmsthre,
+                class_agnostic_nms=True,
+            )
 
         return outputs, img_info
     
 
-def image_demo(predictor, vis_folder, current_time, args):
+def image_demo(predictor, vis_folder, current_time, args, reid_extractor=None):
     if osp.isdir(args.path):
         files = get_image_list(args.path)
     else:
@@ -208,8 +237,15 @@ def image_demo(predictor, vis_folder, current_time, args):
 
     for frame_id, img_path in enumerate(files, 1):
         outputs, img_info = predictor.inference(img_path, timer)
+        det_feats = None
         if outputs[0] is not None:
-            online_targets = tracker.update(outputs[0], [img_info['height'], img_info['width']], exp.test_size)
+            outputs[0] = filter_to_first_n_coco_classes(outputs[0], n=8)
+        if reid_extractor is not None and outputs[0] is not None and outputs[0].shape[0] > 0:
+            tlbrs = outputs[0][:, :4].cpu().numpy()
+            tlbrs = tlbrs / img_info["ratio"]
+            det_feats = reid_extractor.extract(img_info["raw_img"], tlbrs)
+        if outputs[0] is not None:
+            online_targets = tracker.update(outputs[0], [img_info['height'], img_info['width']], exp.test_size, det_feats)
             online_tlwhs = []
             online_ids = []
             online_scores = []
@@ -254,7 +290,7 @@ def image_demo(predictor, vis_folder, current_time, args):
         logger.info(f"save results to {res_file}")
 
 
-def imageflow_demo(predictor, vis_folder, current_time, args):
+def imageflow_demo(predictor, vis_folder, current_time, args, reid_extractor=None):
     cap = cv2.VideoCapture(args.path if args.demo == "video" else args.camid)
     width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)  # float
     height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)  # float
@@ -280,11 +316,15 @@ def imageflow_demo(predictor, vis_folder, current_time, args):
         ret_val, frame = cap.read()
         if ret_val:
             outputs, img_info = predictor.inference(frame, timer)
+            det_feats = None
             if outputs[0] is not None:
-                # s = outputs[0][:, 4]
-                # print("[DET] score stats:",
-                #     float(s.min()), float(s.max()), float(s.mean()), "num:", s.shape[0])
-                online_targets = tracker.update(outputs[0], [img_info['height'], img_info['width']], exp.test_size)
+                outputs[0] = filter_to_first_n_coco_classes(outputs[0], n=8)
+            if reid_extractor is not None and outputs[0] is not None and outputs[0].shape[0] > 0:
+                tlbrs = outputs[0][:, :4].cpu().numpy()
+                tlbrs = tlbrs / img_info["ratio"]
+                det_feats = reid_extractor.extract(img_info["raw_img"], tlbrs)
+            if outputs[0] is not None:
+                online_targets = tracker.update(outputs[0], [img_info['height'], img_info['width']], exp.test_size, det_feats)
                 online_tlwhs = []
                 online_ids = []
                 online_scores = []
@@ -338,12 +378,8 @@ def main(exp, args):
         args.device = "gpu"
     args.device = torch.device("cuda" if args.device == "gpu" else "cpu")
 
-    logger.info("Args: {}".format(args))
-
-    if args.conf is not None:
-        exp.test_conf = args.conf
-    if args.nms is not None:
-        exp.nmsthre = args.nms
+    exp.test_conf = args.conf
+    exp.nmsthre = args.nms
     if args.tsize is not None:
         exp.test_size = (args.tsize, args.tsize)
 
@@ -360,7 +396,6 @@ def main(exp, args):
         ckpt = torch.load(ckpt_file, map_location="cpu")
         # load the model state dict
         model.load_state_dict(ckpt["model"])
-        logger.info("loaded checkpoint done.")
 
     if args.fuse:
         logger.info("\tFusing model...")
@@ -382,12 +417,23 @@ def main(exp, args):
         trt_file = None
         decoder = None
 
-    predictor = OfficialPredictor(model, exp, COCO_CLASSES,trt_file, decoder, args.device, args.fp16,args.legacy)
+    predictor = OfficialPredictor(model, exp, COCO_CLASSES, trt_file, decoder, args.device, args.fp16, args.legacy)
+    reid_extractor = None
+    if args.reid:
+        if not args.reid_config or not args.reid_weights:
+            raise ValueError("FastReID enabled but reid_config/reid_weights not provided.")
+        reid_device = "cuda" if args.reid_device == "gpu" else "cpu"
+        reid_extractor = FastReIDExtractor(
+            args.reid_config,
+            args.reid_weights,
+            device=reid_device,
+            batch_size=args.reid_batch,
+        )
     current_time = time.localtime()
     if args.demo == "image":
-        image_demo(predictor, vis_folder, current_time, args)
+        image_demo(predictor, vis_folder, current_time, args, reid_extractor=reid_extractor)
     elif args.demo == "video" or args.demo == "webcam":
-        imageflow_demo(predictor, vis_folder, current_time, args)
+        imageflow_demo(predictor, vis_folder, current_time, args, reid_extractor=reid_extractor)
 
 
 if __name__ == "__main__":
