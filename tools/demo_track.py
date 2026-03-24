@@ -18,6 +18,20 @@ from yolox.data.datasets import COCO_CLASSES
 
 IMAGE_EXT = [".jpg", ".jpeg", ".webp", ".bmp", ".png"]
 
+THRESHOLD_DEFAULTS = {
+    # Detection (YOLO single-frame)
+    "conf": 0.2,
+    "nms": 0.6,
+    # Tracking
+    "track_thresh": 0.02,
+    "track_buffer": 30,
+    "match_thresh": 0.7,
+    "maha_thresh": 100.0,
+    # Post-filter after tracking
+    "aspect_ratio_thresh": 100.0,
+    "min_box_area": 0.0,
+}
+
 """
 Example command:
 PYTHONPATH=/home/yuhu100/文档/MRT_HiWi/ByteTrack/ByteTrack/fast-reid:$PYTHONPATH \
@@ -30,7 +44,7 @@ python tools/demo_track.py video \
   --reid \
   --reid_config /home/yuhu100/文档/MRT_HiWi/ByteTrack/ByteTrack/fast-reid/configs/Market1501/bagtricks_R50.yml \
   --reid_weights /home/yuhu100/文档/MRT_HiWi/ByteTrack/ByteTrack/fast-reid/pretrained/market_bot_R50.pth
-"""
+""" 
 
 
 def make_parser():
@@ -67,8 +81,6 @@ def make_parser():
         type=str,
         help="device to run our model, can either be cpu or gpu",
     )
-    parser.add_argument("--conf", default=0.05, type=float, help="test conf")
-    parser.add_argument("--nms", default=0.8, type=float, help="test nms threshold")
     parser.add_argument("--tsize", default=None, type=int, help="test img size")
     parser.add_argument("--fps", default=30, type=int, help="frame rate (fps)")
     parser.add_argument(
@@ -99,16 +111,18 @@ def make_parser():
         action="store_true",
         help="Using TensorRT model for testing.",
     )
-    # tracking args
-    parser.add_argument("--track_thresh", type=float, default=0.02, help="tracking confidence threshold")
-    parser.add_argument("--track_buffer", type=int, default=30, help="the frames for keep lost tracks")
-    parser.add_argument("--match_thresh", type=float, default=0.7, help="matching threshold for tracking")
-    parser.add_argument("--center_thresh", type=float, default=200.0, help="center distance gating threshold (pixels); <=0 disables")
+    # unified thresholds (detection + tracking + post-filter)
+    parser.add_argument("--conf", default=THRESHOLD_DEFAULTS["conf"], type=float, help="YOLO detection confidence threshold")
+    parser.add_argument("--nms", default=THRESHOLD_DEFAULTS["nms"], type=float, help="YOLO NMS IoU threshold")
+    parser.add_argument("--track_thresh", type=float, default=THRESHOLD_DEFAULTS["track_thresh"], help="tracking confidence threshold")
+    parser.add_argument("--track_buffer", type=int, default=THRESHOLD_DEFAULTS["track_buffer"], help="keep lost tracks for this many frames")
+    parser.add_argument("--match_thresh", type=float, default=THRESHOLD_DEFAULTS["match_thresh"], help="association threshold for tracking")
+    parser.add_argument("--maha_thresh", type=float, default=THRESHOLD_DEFAULTS["maha_thresh"], help="squared Mahalanobis gating threshold; <=0 disables")
     parser.add_argument(
-        "--aspect_ratio_thresh", type=float, default=100.0,
+        "--aspect_ratio_thresh", type=float, default=THRESHOLD_DEFAULTS["aspect_ratio_thresh"],
         help="threshold for filtering out boxes of which aspect ratio are above the given value."
     )
-    parser.add_argument('--min_box_area', type=float, default=0, help='filter out tiny boxes')
+    parser.add_argument('--min_box_area', type=float, default=THRESHOLD_DEFAULTS["min_box_area"], help='filter out tiny boxes')
     parser.add_argument("--mot20", dest="mot20", default=False, action="store_true", help="test mot20.")
     parser.add_argument("--reid", action="store_true", help="enable FastReID features for association")
     parser.add_argument("--reid_config", type=str, default="", help="FastReID config file")

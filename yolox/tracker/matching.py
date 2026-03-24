@@ -201,3 +201,62 @@ def fuse_score(cost_matrix, detections):
     fuse_sim = iou_sim * det_scores
     fuse_cost = 1 - fuse_sim
     return fuse_cost
+
+
+def mahalanobis_distance(kf, tracks, detections, only_position=True):
+    """
+    Compute pairwise squared Mahalanobis distance between KF-predicted tracks
+    and current detections in measurement space.
+    """
+    if len(tracks) == 0 or len(detections) == 0:
+        return np.zeros((len(tracks), len(detections)), dtype=float)
+
+    measurements = np.asarray([det.to_xyah() for det in detections], dtype=float)
+    dists = np.full((len(tracks), len(detections)), np.inf, dtype=float)
+    for i, track in enumerate(tracks):
+        if track.mean is None or track.covariance is None:
+            continue
+        dists[i] = kf.gating_distance(
+            track.mean,
+            track.covariance,
+            measurements,
+            only_position=only_position,
+            metric='maha',
+        )
+    return dists
+
+
+def associate_tracks_detections(
+    tracks,
+    detections,
+    match_thresh,
+    kf=None,
+    maha_thresh=100.0,
+    only_position=True,
+    mot20=False,
+    use_fuse_score_on_iou=True,
+):
+    """
+    Unified association entry:
+    1) ReID (if features available) + optional KF Mahalanobis gate
+    2) Otherwise IoU distance (+ optional score fusion)
+    3) Hungarian assignment with threshold
+    """
+    use_reid = (
+        len(tracks) > 0
+        and len(detections) > 0
+        and all(t.smooth_feat is not None for t in tracks)
+        and all(d.curr_feat is not None for d in detections)
+    )
+
+    if use_reid:
+        dists = embedding_distance(tracks, detections)
+        if kf is not None and maha_thresh is not None and maha_thresh > 0:
+            maha_dists = mahalanobis_distance(kf, tracks, detections, only_position=only_position)
+            dists[maha_dists > maha_thresh] = np.inf
+    else:
+        dists = iou_distance(tracks, detections)
+        if use_fuse_score_on_iou and not mot20:
+            dists = fuse_score(dists, detections)
+
+    return linear_assignment(dists, thresh=match_thresh)

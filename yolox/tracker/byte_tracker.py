@@ -229,23 +229,16 @@ class BYTETracker(object):
         strack_pool = joint_stracks(tracked_stracks, self.lost_stracks)
         # Predict the current location with KF
         STrack.multi_predict(strack_pool)
-        use_reid = (
-            det_feats is not None
-            and len(strack_pool) > 0
-            and len(detections) > 0
-            and all(t.smooth_feat is not None for t in strack_pool)
-            and all(d.curr_feat is not None for d in detections)
+        matches, u_track, u_detection = matching.associate_tracks_detections(
+            strack_pool,
+            detections,
+            match_thresh=self.args.match_thresh,
+            kf=self.kalman_filter,
+            maha_thresh=getattr(self.args, "maha_thresh", 100.0),
+            only_position=True,
+            mot20=self.args.mot20,
+            use_fuse_score_on_iou=True,
         )
-        if use_reid:
-            dists = matching.embedding_distance(strack_pool, detections)
-            if getattr(self.args, "center_thresh", 0) and self.args.center_thresh > 0:
-                center_dists = matching.center_distance(strack_pool, detections)
-                dists[center_dists > self.args.center_thresh] = np.inf
-        else:
-            dists = matching.iou_distance(strack_pool, detections)
-            if not self.args.mot20:
-                dists = matching.fuse_score(dists, detections)
-        matches, u_track, u_detection = matching.linear_assignment(dists, thresh=self.args.match_thresh)
 
         for itracked, idet in matches:
             track = strack_pool[itracked]
@@ -268,22 +261,17 @@ class BYTETracker(object):
         else:
             detections_second = []
         r_tracked_stracks = [strack_pool[i] for i in u_track if strack_pool[i].state == TrackState.Tracked]
-        use_reid_second = (
-            det_feats_second is not None
-            and len(r_tracked_stracks) > 0
-            and len(detections_second) > 0
-            and all(t.smooth_feat is not None for t in r_tracked_stracks)
-            and all(d.curr_feat is not None for d in detections_second)
-        )
-        if use_reid_second:
-            dists = matching.embedding_distance(r_tracked_stracks, detections_second)
-            if getattr(self.args, "center_thresh", 0) and self.args.center_thresh > 0:
-                center_dists = matching.center_distance(r_tracked_stracks, detections_second)
-                dists[center_dists > self.args.center_thresh] = np.inf
-        else:
-            dists = matching.iou_distance(r_tracked_stracks, detections_second)
         match_thresh_low = max(self.args.match_thresh - 0.2, 0.0)
-        matches, u_track, u_detection_second = matching.linear_assignment(dists, match_thresh_low)
+        matches, u_track, u_detection_second = matching.associate_tracks_detections(
+            r_tracked_stracks,
+            detections_second,
+            match_thresh=match_thresh_low,
+            kf=self.kalman_filter,
+            maha_thresh=getattr(self.args, "maha_thresh", 100.0),
+            only_position=True,
+            mot20=self.args.mot20,
+            use_fuse_score_on_iou=False,
+        )
         for itracked, idet in matches:
             track = r_tracked_stracks[itracked]
             det = detections_second[idet]
@@ -302,23 +290,16 @@ class BYTETracker(object):
 
         '''Deal with unconfirmed tracks, usually tracks with only one beginning frame'''
         detections = [detections[i] for i in u_detection]
-        use_reid_unconfirmed = (
-            det_feats is not None
-            and len(unconfirmed) > 0
-            and len(detections) > 0
-            and all(t.smooth_feat is not None for t in unconfirmed)
-            and all(d.curr_feat is not None for d in detections)
+        matches, u_unconfirmed, u_detection = matching.associate_tracks_detections(
+            unconfirmed,
+            detections,
+            match_thresh=self.args.match_thresh,
+            kf=self.kalman_filter,
+            maha_thresh=getattr(self.args, "maha_thresh", 100.0),
+            only_position=True,
+            mot20=self.args.mot20,
+            use_fuse_score_on_iou=True,
         )
-        if use_reid_unconfirmed:
-            dists = matching.embedding_distance(unconfirmed, detections)
-            if getattr(self.args, "center_thresh", 0) and self.args.center_thresh > 0:
-                center_dists = matching.center_distance(unconfirmed, detections)
-                dists[center_dists > self.args.center_thresh] = np.inf
-        else:
-            dists = matching.iou_distance(unconfirmed, detections)
-            if not self.args.mot20:
-                dists = matching.fuse_score(dists, detections)
-        matches, u_unconfirmed, u_detection = matching.linear_assignment(dists, self.args.match_thresh)
         for itracked, idet in matches:
             unconfirmed[itracked].update(detections[idet], self.frame_id)
             activated_starcks.append(unconfirmed[itracked])
