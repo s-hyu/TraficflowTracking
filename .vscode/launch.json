@@ -19,7 +19,7 @@
         "--ckpt",
         "pretrained/yolox_x.pth",
         "--path",
-        "videos/test1.mp4",
+        "videos/left.mp4",
         "--save_result",
         "--device",
         "gpu",
@@ -28,6 +28,39 @@
         "fast-reid/configs/Market1501/bagtricks_R50.yml",
         "--reid_weights",
         "fast-reid/pretrained/market_bot_R50.pth"
+      ]
+    },
+    {
+      "name": "debugger demo_track video (ReID)",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/debugger/demo_track.py",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/fast-reid:${workspaceFolder}:${env:PYTHONPATH}"
+      },
+      "args": [
+        "video",
+        "-f",
+        "exps/example/coco/yolox_x.py",
+        "--ckpt",
+        "pretrained/yolox_x.pth",
+        "--path",
+        "videos/left.mp4",
+        "--save_result",
+        "--device",
+        "gpu",
+        "--reid",
+        "--reid_config",
+        "fast-reid/configs/Market1501/bagtricks_R50.yml",
+        "--reid_weights",
+        "fast-reid/pretrained/market_bot_R50.pth",
+        "--debug_costs",
+        "--debug_frame_start",
+        "1",
+        "--debug_frame_end",
+        "150"
       ]
     }
   ]

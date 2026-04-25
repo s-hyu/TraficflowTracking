@@ -50,20 +50,13 @@ class FastReIDExtractor(object):
         boxes[:, 3] = np.clip(boxes[:, 3], 0, h - 1)
         return boxes
 
-    def extract(self, image_bgr, tlbrs):
-        if tlbrs is None or len(tlbrs) == 0:
+    def extract_patches(self, patches):
+        """
+        Extract features from a list of BGR patches. Each entry can be
+        np.ndarray(H, W, 3) or None. Output rows align with input order.
+        """
+        if patches is None or len(patches) == 0:
             return np.zeros((0, 0), dtype=np.float32)
-
-        h, w = image_bgr.shape[:2]
-        boxes = np.asarray(tlbrs, dtype=np.float32).copy()
-        boxes = self._clip_boxes(boxes, w, h)
-        patches = []
-        for x1, y1, x2, y2 in boxes:
-            if x2 <= x1 or y2 <= y1:
-                patches.append(None)
-                continue
-            patch = image_bgr[int(y1):int(y2), int(x1):int(x2)]
-            patches.append(patch)
 
         feats = []
         with torch.no_grad():
@@ -99,3 +92,19 @@ class FastReIDExtractor(object):
                         feats.append(next(out_iter))
 
         return np.asarray(feats, dtype=np.float32)
+
+    def extract(self, image_bgr, tlbrs):
+        if tlbrs is None or len(tlbrs) == 0:
+            return np.zeros((0, 0), dtype=np.float32)
+
+        h, w = image_bgr.shape[:2]
+        boxes = np.asarray(tlbrs, dtype=np.float32).copy()
+        boxes = self._clip_boxes(boxes, w, h)
+        patches = []
+        for x1, y1, x2, y2 in boxes:
+            if x2 <= x1 or y2 <= y1:
+                patches.append(None)
+                continue
+            patch = image_bgr[int(y1):int(y2), int(x1):int(x2)]
+            patches.append(patch)
+        return self.extract_patches(patches)

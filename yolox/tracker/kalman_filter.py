@@ -22,35 +22,104 @@ chi2inv95 = {
 
 class KalmanFilter(object):
     """
-    A simple Kalman filter for tracking bounding boxes in image space.
+    A simple Kalman filter for tracking object motion.
 
     The 8-dimensional state space
 
-        x, y, a, h, vx, vy, va, vh
+        x, y, vx, vy, ax, ay, r, h
 
-    contains the bounding box center position (x, y), aspect ratio a, height h,
-    and their respective velocities.
+    contains the motion point position (x, y), point velocity (vx, vy),
+    point acceleration (ax, ay), aspect ratio r, and height h. In the current
+    vehicle-tracking pipeline, (x, y) can be the homography-projected
+    bottom-center point in the ground-view plane while r/h remain image-box
+    shape observations for compatibility.
 
-    Object motion follows a constant velocity model. The bounding box location
-    (x, y, a, h) is taken as direct observation of the state space (linear
-    observation model).
+    Object motion follows a constant acceleration model for the center point.
+    The bounding box measurement (x, y, r, h) is taken as a direct observation
+    of the state space (linear observation model).
+
+    For vehicle tracking we additionally smooth vx/vy and ax/ay from a short
+    observation window so the predicted center motion is less sensitive to
+    frame-to-frame box jitter.
 
     """
 
     def __init__(self):
-        ndim, dt = 4, 1.
+        dt = 1.0
+        self._motion_mat = np.eye(8, 8)
+        self._motion_mat[0, 2] = dt
+        self._motion_mat[1, 3] = dt
+        self._motion_mat[0, 4] = 0.5 * dt * dt
+        self._motion_mat[1, 5] = 0.5 * dt * dt
+        self._motion_mat[2, 4] = dt
+        self._motion_mat[3, 5] = dt
 
-        # Create Kalman filter model matrices.
-        self._motion_mat = np.eye(2 * ndim, 2 * ndim)
-        for i in range(ndim):
-            self._motion_mat[i, ndim + i] = dt
-        self._update_mat = np.eye(ndim, 2 * ndim)
+        self._update_mat = np.zeros((4, 8))
+        self._update_mat[0, 0] = 1.0
+        self._update_mat[1, 1] = 1.0
+        self._update_mat[2, 6] = 1.0
+        self._update_mat[3, 7] = 1.0
 
         # Motion and observation uncertainty are chosen relative to the current
         # state estimate. These weights control the amount of uncertainty in
         # the model. This is a bit hacky.
         self._std_weight_position = 1. / 20
         self._std_weight_velocity = 1. / 160
+        self.velocity_weights = np.asarray([0.5, 1.0, 2.0, 3.0, 4.0], dtype=float)
+        self.velocity_window = len(self.velocity_weights)
+        self.center_window = self.velocity_window + 1
+
+    def estimate_window_motion(self, center_history):
+        """Estimate vx/vy and ax/ay from weighted per-frame center differences."""
+        if center_history is None or len(center_history) < 2:
+            return None
+
+        history = list(center_history)[-self.center_window:]
+        velocities = []
+        velocity_frame_ids = []
+        for idx in range(1, len(history)):
+            prev_frame, prev_x, prev_y = history[idx - 1]
+            curr_frame, curr_x, curr_y = history[idx]
+            dt = max(int(curr_frame - prev_frame), 1)
+            velocities.append(((curr_x - prev_x) / dt, (curr_y - prev_y) / dt))
+            velocity_frame_ids.append(curr_frame)
+
+        if not velocities:
+            return None
+
+        velocity_weights = self.velocity_weights[-len(velocities):]
+        velocity_weights = velocity_weights / velocity_weights.sum()
+        velocity_array = np.asarray(velocities, dtype=float)
+        vx, vy = np.sum(velocity_array * velocity_weights[:, None], axis=0)
+
+        ax = 0.0
+        ay = 0.0
+        if len(velocities) >= 2:
+            accelerations = []
+            for idx in range(1, len(velocities)):
+                prev_vx, prev_vy = velocities[idx - 1]
+                curr_vx, curr_vy = velocities[idx]
+                dt = max(int(velocity_frame_ids[idx] - velocity_frame_ids[idx - 1]), 1)
+                accelerations.append(((curr_vx - prev_vx) / dt, (curr_vy - prev_vy) / dt))
+            accel_weights = self.velocity_weights[-len(accelerations):]
+            accel_weights = accel_weights / accel_weights.sum()
+            accel_array = np.asarray(accelerations, dtype=float)
+            ax, ay = np.sum(accel_array * accel_weights[:, None], axis=0)
+
+        return vx, vy, ax, ay
+
+    def apply_window_motion(self, mean, center_history):
+        """Overwrite center velocity/acceleration with smoothed window estimates."""
+        motion = self.estimate_window_motion(center_history)
+        if motion is None:
+            return mean
+
+        mean = mean.copy()
+        mean[2] = motion[0]
+        mean[3] = motion[1]
+        mean[4] = motion[2]
+        mean[5] = motion[3]
+        return mean
 
     def initiate(self, measurement):
         """Create track from unassociated measurement.
@@ -69,19 +138,27 @@ class KalmanFilter(object):
             to 0 mean.
 
         """
-        mean_pos = measurement
-        mean_vel = np.zeros_like(mean_pos)
-        mean = np.r_[mean_pos, mean_vel]
+        mean = np.array([
+            measurement[0],
+            measurement[1],
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            measurement[2],
+            measurement[3],
+        ], dtype=float)
 
         std = [
             2 * self._std_weight_position * measurement[3],
             2 * self._std_weight_position * measurement[3],
+            10 * self._std_weight_velocity * measurement[3],
+            10 * self._std_weight_velocity * measurement[3],
+            20 * self._std_weight_velocity * measurement[3],
+            20 * self._std_weight_velocity * measurement[3],
             1e-2,
             2 * self._std_weight_position * measurement[3],
-            10 * self._std_weight_velocity * measurement[3],
-            10 * self._std_weight_velocity * measurement[3],
-            1e-5,
-            10 * self._std_weight_velocity * measurement[3]]
+        ]
         covariance = np.diag(np.square(std))
         return mean, covariance
 
@@ -101,22 +178,21 @@ class KalmanFilter(object):
         -------
         (ndarray, ndarray)
             Returns the mean vector and covariance matrix of the predicted
-            state. Unobserved velocities are initialized to 0 mean.
+            state.
 
         """
         std_pos = [
-            self._std_weight_position * mean[3],
-            self._std_weight_position * mean[3],
+            self._std_weight_position * mean[7],
+            self._std_weight_position * mean[7],
+            self._std_weight_velocity * mean[7],
+            self._std_weight_velocity * mean[7],
+            2 * self._std_weight_velocity * mean[7],
+            2 * self._std_weight_velocity * mean[7],
             1e-2,
-            self._std_weight_position * mean[3]]
-        std_vel = [
-            self._std_weight_velocity * mean[3],
-            self._std_weight_velocity * mean[3],
-            1e-5,
-            self._std_weight_velocity * mean[3]]
-        motion_cov = np.diag(np.square(np.r_[std_pos, std_vel]))
+            self._std_weight_position * mean[7],
+        ]
+        motion_cov = np.diag(np.square(std_pos))
 
-        #mean = np.dot(self._motion_mat, mean)
         mean = np.dot(mean, self._motion_mat.T)
         covariance = np.linalg.multi_dot((
             self._motion_mat, covariance, self._motion_mat.T)) + motion_cov
@@ -141,10 +217,11 @@ class KalmanFilter(object):
 
         """
         std = [
-            self._std_weight_position * mean[3],
-            self._std_weight_position * mean[3],
+            self._std_weight_position * mean[7],
+            self._std_weight_position * mean[7],
             1e-1,
-            self._std_weight_position * mean[3]]
+            self._std_weight_position * mean[7],
+        ]
         innovation_cov = np.diag(np.square(std))
 
         mean = np.dot(self._update_mat, mean)
@@ -166,19 +243,19 @@ class KalmanFilter(object):
         -------
         (ndarray, ndarray)
             Returns the mean vector and covariance matrix of the predicted
-            state. Unobserved velocities are initialized to 0 mean.
+            state.
         """
-        std_pos = [
-            self._std_weight_position * mean[:, 3],
-            self._std_weight_position * mean[:, 3],
-            1e-2 * np.ones_like(mean[:, 3]),
-            self._std_weight_position * mean[:, 3]]
-        std_vel = [
-            self._std_weight_velocity * mean[:, 3],
-            self._std_weight_velocity * mean[:, 3],
-            1e-5 * np.ones_like(mean[:, 3]),
-            self._std_weight_velocity * mean[:, 3]]
-        sqr = np.square(np.r_[std_pos, std_vel]).T
+        std_terms = [
+            self._std_weight_position * mean[:, 7],
+            self._std_weight_position * mean[:, 7],
+            self._std_weight_velocity * mean[:, 7],
+            self._std_weight_velocity * mean[:, 7],
+            2 * self._std_weight_velocity * mean[:, 7],
+            2 * self._std_weight_velocity * mean[:, 7],
+            1e-2 * np.ones_like(mean[:, 7]),
+            self._std_weight_position * mean[:, 7],
+        ]
+        sqr = np.square(np.asarray(std_terms, dtype=float)).T
 
         motion_cov = []
         for i in range(len(mean)):

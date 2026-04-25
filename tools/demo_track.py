@@ -15,22 +15,12 @@ from yolox.tracking_utils.timer import Timer
 
 from yolox.data.data_augment import ValTransform
 from yolox.data.datasets import COCO_CLASSES
+try:
+    from track_vis.visualize_track_trails import visualize_track_trails
+except ImportError:
+    from tools.track_vis.visualize_track_trails import visualize_track_trails
 
 IMAGE_EXT = [".jpg", ".jpeg", ".webp", ".bmp", ".png"]
-
-THRESHOLD_DEFAULTS = {
-    # Detection (YOLO single-frame)
-    "conf": 0.2,
-    "nms": 0.6,
-    # Tracking
-    "track_thresh": 0.02,
-    "track_buffer": 30,
-    "match_thresh": 0.7,
-    "maha_thresh": 100.0,
-    # Post-filter after tracking
-    "aspect_ratio_thresh": 100.0,
-    "min_box_area": 0.0,
-}
 
 """
 Example command:
@@ -38,7 +28,7 @@ PYTHONPATH=/home/yuhu100/文档/MRT_HiWi/ByteTrack/ByteTrack/fast-reid:$PYTHONPA
 python tools/demo_track.py video \
   -f exps/example/coco/yolox_x.py \
   --ckpt pretrained/yolox_x.pth \
-  --path videos/test2.mp4 \
+  --path videos/left.mp4 \
   --save_result \
   --device gpu \
   --reid \
@@ -46,18 +36,56 @@ python tools/demo_track.py video \
   --reid_weights /home/yuhu100/文档/MRT_HiWi/ByteTrack/ByteTrack/fast-reid/pretrained/market_bot_R50.pth
 """ 
 
+THRESHOLD_DEFAULTS = {
+    # Detection (YOLO single-frame)
+    "conf": 0.080,
+    "nms": 0.5,
+    # Tracking
+    "track_thresh": 0.02,
+    "track_buffer": 30,
+    "match_thresh": 0.7,
+    "maha_thresh": 20.0,
+    "maha_thresh_roi": 20.0,
+    "maha_roi_polygon": "110,797;107,967;1062,1211;1573,887",
+    "velocity_min_speed": 0.05,
+    # Post-filter after tracking
+    "aspect_ratio_thresh": 100.0,
+    "min_box_area": 0.0,
+}
+
+
+def add_maha_region_args(parser):
+    parser.add_argument(
+        "--maha_thresh",
+        type=float,
+        default=THRESHOLD_DEFAULTS["maha_thresh"],
+        help="squared Mahalanobis gating threshold outside ROI; <=0 disables",
+    )
+    parser.add_argument(
+        "--maha_thresh_roi",
+        type=float,
+        default=THRESHOLD_DEFAULTS["maha_thresh_roi"],
+        help="squared Mahalanobis threshold inside ROI polygon",
+    )
+    parser.add_argument(
+        "--maha_roi_polygon",
+        type=str,
+        default=THRESHOLD_DEFAULTS["maha_roi_polygon"],
+        help="ROI polygon as 'x1,y1;x2,y2;...'; inside uses --maha_thresh_roi",
+    )
+
 
 def make_parser():
     parser = argparse.ArgumentParser("ByteTrack Demo!")
     parser.add_argument(
-        "demo", default="image", help="demo type, eg. image, video and webcam"
+        "demo", nargs="?", default="video", help="demo type, eg. image, video and webcam"
     )
     parser.add_argument("-expn", "--experiment-name", type=str, default=None)
     parser.add_argument("-n", "--name", type=str, default=None, help="model name")
 
     parser.add_argument(
         #"--path", default="./datasets/mot/train/MOT17-05-FRCNN/img1", help="path to images or video"
-        "--path", default="./videos/palace.mp4", help="path to images or video"
+        "--path", default="videos/left.mp4", help="path to images or video"
     )
     parser.add_argument("--camid", type=int, default=0, help="webcam demo camera id")
     parser.add_argument(
@@ -70,11 +98,11 @@ def make_parser():
     parser.add_argument(
         "-f",
         "--exp_file",
-        default=None,
+        default="exps/example/coco/yolox_x.py",
         type=str,
         help="pls input your expriment description file",
     )
-    parser.add_argument("-c", "--ckpt", default=None, type=str, help="ckpt for eval")
+    parser.add_argument("-c", "--ckpt", default="pretrained/yolox_x.pth", type=str, help="ckpt for eval")
     parser.add_argument(
         "--device",
         default="gpu",
@@ -117,7 +145,13 @@ def make_parser():
     parser.add_argument("--track_thresh", type=float, default=THRESHOLD_DEFAULTS["track_thresh"], help="tracking confidence threshold")
     parser.add_argument("--track_buffer", type=int, default=THRESHOLD_DEFAULTS["track_buffer"], help="keep lost tracks for this many frames")
     parser.add_argument("--match_thresh", type=float, default=THRESHOLD_DEFAULTS["match_thresh"], help="association threshold for tracking")
-    parser.add_argument("--maha_thresh", type=float, default=THRESHOLD_DEFAULTS["maha_thresh"], help="squared Mahalanobis gating threshold; <=0 disables")
+    parser.add_argument(
+        "--velocity_min_speed",
+        type=float,
+        default=THRESHOLD_DEFAULTS["velocity_min_speed"],
+        help="minimum ground-plane speed for using velocity direction in ReID association",
+    )
+    add_maha_region_args(parser)
     parser.add_argument(
         "--aspect_ratio_thresh", type=float, default=THRESHOLD_DEFAULTS["aspect_ratio_thresh"],
         help="threshold for filtering out boxes of which aspect ratio are above the given value."
@@ -129,6 +163,21 @@ def make_parser():
     parser.add_argument("--reid_weights", type=str, default="", help="FastReID model weights")
     parser.add_argument("--reid_batch", type=int, default=32, help="FastReID batch size")
     parser.add_argument("--reid_device", type=str, default="gpu", help="FastReID device: cpu/gpu")
+    parser.add_argument(
+        "--ground_homography",
+        type=str,
+        default="auto",
+        help=(
+            "Homography for bottom-center ground-plane motion. "
+            "'auto' maps videos/left.mp4 to H_left_to_ground(_50pts).txt and "
+            "videos/center.mp4 to H_center_to_ground(_50pts).txt; empty/none disables."
+        ),
+    )
+    parser.add_argument(
+        "--disable_ground_motion",
+        action="store_true",
+        help="Disable bottom-center ground-plane coordinates in the Kalman motion model.",
+    )
     return parser
 
 
@@ -154,6 +203,25 @@ def write_results(filename, results):
                 line = save_format.format(frame=frame_id, id=track_id, x1=round(x1, 1), y1=round(y1, 1), w=round(w, 1), h=round(h, 1), s=round(score, 2))
                 f.write(line)
     logger.info('save results to {}'.format(filename))
+
+
+def _save_track_artifacts(results, vis_folder, timestamp, video_path="", background_image="", width=0, height=0):
+    res_file = osp.join(vis_folder, f"{timestamp}.txt")
+    with open(res_file, "w", encoding="utf-8") as f:
+        f.writelines(results)
+    logger.info(f"save results to {res_file}")
+
+    traj_image = osp.join(vis_folder, f"{timestamp}_traj.png")
+    visualize_track_trails(
+        track_file=res_file,
+        output_image=traj_image,
+        video_path=video_path,
+        background_image=background_image,
+        width=width,
+        height=height,
+        use_background=bool(background_image),
+    )
+    logger.info(f"save trajectory image to {traj_image}")
 
 
 def filter_to_first_n_coco_classes(detections, n=8):
@@ -248,9 +316,16 @@ def image_demo(predictor, vis_folder, current_time, args, reid_extractor=None):
     tracker = BYTETracker(args, frame_rate=args.fps)
     timer = Timer()
     results = []
+    timestamp = time.strftime("%Y_%m_%d_%H_%M_%S", current_time)
+    save_folder = osp.join(vis_folder, timestamp)
+    os.makedirs(save_folder, exist_ok=True)
+    image_width = 0
+    image_height = 0
 
     for frame_id, img_path in enumerate(files, 1):
         outputs, img_info = predictor.inference(img_path, timer)
+        image_width = img_info["width"]
+        image_height = img_info["height"]
         det_feats = None
         if outputs[0] is not None:
             outputs[0] = filter_to_first_n_coco_classes(outputs[0], n=8)
@@ -285,9 +360,6 @@ def image_demo(predictor, vis_folder, current_time, args, reid_extractor=None):
 
         # result_image = predictor.visual(outputs[0], img_info, predictor.confthre)
         if args.save_result:
-            timestamp = time.strftime("%Y_%m_%d_%H_%M_%S", current_time)
-            save_folder = osp.join(vis_folder, timestamp)
-            os.makedirs(save_folder, exist_ok=True)
             cv2.imwrite(osp.join(save_folder, osp.basename(img_path)), online_im)
 
         if frame_id % 20 == 0:
@@ -297,11 +369,16 @@ def image_demo(predictor, vis_folder, current_time, args, reid_extractor=None):
         if ch == 27 or ch == ord("q") or ch == ord("Q"):
             break
 
-    if args.save_result:
-        res_file = osp.join(vis_folder, f"{timestamp}.txt")
-        with open(res_file, 'w') as f:
-            f.writelines(results)
-        logger.info(f"save results to {res_file}")
+    bg_image = args.path if osp.isfile(args.path) else ""
+    _save_track_artifacts(
+        results=results,
+        vis_folder=vis_folder,
+        timestamp=timestamp,
+        video_path="",
+        background_image=bg_image,
+        width=int(image_width),
+        height=int(image_height),
+    )
 
 
 def imageflow_demo(predictor, vis_folder, current_time, args, reid_extractor=None):
@@ -309,6 +386,8 @@ def imageflow_demo(predictor, vis_folder, current_time, args, reid_extractor=Non
     width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)  # float
     height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)  # float
     fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps is None or fps <= 0:
+        fps = 30.0
     timestamp = time.strftime("%Y_%m_%d_%H_%M_%S", current_time)
     save_folder = osp.join(vis_folder, timestamp)
     os.makedirs(save_folder, exist_ok=True)
@@ -324,12 +403,16 @@ def imageflow_demo(predictor, vis_folder, current_time, args, reid_extractor=Non
     timer = Timer()
     frame_id = 0
     results = []
+    canvas_w = int(width)
+    canvas_h = int(height)
     while True:
         if frame_id % 20 == 0:
             logger.info('Processing frame {} ({:.2f} fps)'.format(frame_id, 1. / max(1e-5, timer.average_time)))
         ret_val, frame = cap.read()
         if ret_val:
             outputs, img_info = predictor.inference(frame, timer)
+            canvas_w = int(img_info["width"])
+            canvas_h = int(img_info["height"])
             det_feats = None
             if outputs[0] is not None:
                 outputs[0] = filter_to_first_n_coco_classes(outputs[0], n=8)
@@ -361,8 +444,7 @@ def imageflow_demo(predictor, vis_folder, current_time, args, reid_extractor=Non
             else:
                 timer.toc()
                 online_im = img_info['raw_img']
-            if args.save_result:
-                vid_writer.write(online_im)
+            vid_writer.write(online_im)
             ch = cv2.waitKey(1)
             if ch == 27 or ch == ord("q") or ch == ord("Q"):
                 break
@@ -370,23 +452,32 @@ def imageflow_demo(predictor, vis_folder, current_time, args, reid_extractor=Non
             break
         frame_id += 1
 
-    if args.save_result:
-        res_file = osp.join(vis_folder, f"{timestamp}.txt")
-        with open(res_file, 'w') as f:
-            f.writelines(results)
-        logger.info(f"save results to {res_file}")
+    cap.release()
+    vid_writer.release()
+    video_path = args.path if args.demo == "video" else ""
+    _save_track_artifacts(
+        results=results,
+        vis_folder=vis_folder,
+        timestamp=timestamp,
+        video_path=video_path,
+        background_image="",
+        width=canvas_w,
+        height=canvas_h,
+    )
 
 
 def main(exp, args):
     if not args.experiment_name:
         args.experiment_name = exp.exp_name
 
+    if args.demo in {"image", "video"} and not args.path:
+        raise ValueError("Please provide --path for image/video input, or use the matching launch.json configuration.")
+
     output_dir = osp.join(exp.output_dir, args.experiment_name)
     os.makedirs(output_dir, exist_ok=True)
 
-    if args.save_result:
-        vis_folder = osp.join(output_dir, "track_vis")
-        os.makedirs(vis_folder, exist_ok=True)
+    vis_folder = osp.join(output_dir, "track_vis")
+    os.makedirs(vis_folder, exist_ok=True)
 
     if args.trt:
         args.device = "gpu"

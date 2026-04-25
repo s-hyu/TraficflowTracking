@@ -139,3 +139,19 @@ docs/api
 events.out.tfevents*
 pretrained
 YOLOX_outputs
+# local workspace artifacts
+.codex
+.vscode/
+
+# large data/checkpoints generated locally
+Point_cloud/
+Video-Depth-Anything/checkpoints/
+sam_experiments/outputs/
+sam_experiments/sam2/checkpoints/
+Camera_calibration/calibration_file/
+Camera_calibration/copmuted_points/
+Camera_calibration/imgs/
+Camera_calibration/vis_results/
+Video-Depth-Anything/
+sam_experiments/sam2/
+videos/*.mp4

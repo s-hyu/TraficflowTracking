@@ -12,22 +12,42 @@ from .basetrack import BaseTrack, TrackState
 
 class STrack(BaseTrack):
     shared_kalman = KalmanFilter()
-    def __init__(self, tlwh, score,feat=None):
+    def __init__(self, tlwh, score, feat=None, motion_xy=None):
 
         # wait activate
         self._tlwh = np.asarray(tlwh, dtype=float)
+        self.motion_xy = None if motion_xy is None else np.asarray(motion_xy, dtype=float)
+        self.use_external_motion = self.motion_xy is not None
         self.kalman_filter = None
         self.mean, self.covariance = None, None
         self.is_activated = False
 
         self.score = score
         self.tracklet_len = 0
+        self.center_history = deque(maxlen=self.shared_kalman.center_window)
 
         self.curr_feat = None
         self.smooth_feat =None
         self.alpha = 0.9
         if feat is not None:
             self.update_features(feat)
+
+    def _record_center(self, frame_id, tlwh=None):
+        if frame_id is None:
+            return
+        if self.use_external_motion and self.motion_xy is not None and tlwh is None:
+            x, y = self.motion_xy
+        else:
+            if tlwh is None:
+                tlwh = self.tlwh
+            xyah = self.tlwh_to_xyah(tlwh)
+            x, y = xyah[:2]
+        self.center_history.append((int(frame_id), float(x), float(y)))
+
+    def _apply_window_velocity(self):
+        if self.mean is None:
+            return
+        self.mean = self.shared_kalman.apply_window_motion(self.mean, self.center_history)
 
     def update_features(self,feat):
         feat = feat /(np.linalg.norm(feat) + 1e-8)
@@ -40,17 +60,22 @@ class STrack(BaseTrack):
     def predict(self):
         mean_state = self.mean.copy()
         if self.state != TrackState.Tracked:
-            mean_state[7] = 0
+            mean_state[4] = 0
+            mean_state[5] = 0
+        mean_state = self.kalman_filter.apply_window_motion(mean_state, self.center_history)
         self.mean, self.covariance = self.kalman_filter.predict(mean_state, self.covariance)
 
     @staticmethod
     def multi_predict(stracks):
         if len(stracks) > 0:
+            for st in stracks:
+                st._apply_window_velocity()
             multi_mean = np.asarray([st.mean.copy() for st in stracks])
             multi_covariance = np.asarray([st.covariance for st in stracks])
             for i, st in enumerate(stracks):
                 if st.state != TrackState.Tracked:
-                    multi_mean[i][7] = 0
+                    multi_mean[i][4] = 0
+                    multi_mean[i][5] = 0
             multi_mean, multi_covariance = STrack.shared_kalman.multi_predict(multi_mean, multi_covariance)
             for i, (mean, cov) in enumerate(zip(multi_mean, multi_covariance)):
                 stracks[i].mean = mean
@@ -60,7 +85,7 @@ class STrack(BaseTrack):
         """Start a new tracklet"""
         self.kalman_filter = kalman_filter
         self.track_id = self.next_id()
-        self.mean, self.covariance = self.kalman_filter.initiate(self.tlwh_to_xyah(self._tlwh))
+        self.mean, self.covariance = self.kalman_filter.initiate(self.to_xyah())
 
         self.tracklet_len = 0
         self.state = TrackState.Tracked
@@ -69,10 +94,14 @@ class STrack(BaseTrack):
         # self.is_activated = True
         self.frame_id = frame_id
         self.start_frame = frame_id
+        self._record_center(frame_id)
 
     def re_activate(self, new_track, frame_id, new_id=False):
+        self._tlwh = new_track.tlwh.copy()
+        self.motion_xy = None if new_track.motion_xy is None else new_track.motion_xy.copy()
+        self.use_external_motion = new_track.use_external_motion
         self.mean, self.covariance = self.kalman_filter.update(
-            self.mean, self.covariance, self.tlwh_to_xyah(new_track.tlwh)
+            self.mean, self.covariance, new_track.to_xyah()
         )
         self.tracklet_len = 0
         self.state = TrackState.Tracked
@@ -81,6 +110,8 @@ class STrack(BaseTrack):
         if new_id:
             self.track_id = self.next_id()
         self.score = new_track.score
+        self._record_center(frame_id)
+        self._apply_window_velocity()
         if new_track.curr_feat is not None:
             self.update_features(new_track.curr_feat)
 
@@ -96,12 +127,17 @@ class STrack(BaseTrack):
         self.tracklet_len += 1
 
         new_tlwh = new_track.tlwh
+        self._tlwh = new_tlwh.copy()
+        self.motion_xy = None if new_track.motion_xy is None else new_track.motion_xy.copy()
+        self.use_external_motion = new_track.use_external_motion
         self.mean, self.covariance = self.kalman_filter.update(
-            self.mean, self.covariance, self.tlwh_to_xyah(new_tlwh))
+            self.mean, self.covariance, new_track.to_xyah())
         self.state = TrackState.Tracked
         self.is_activated = True
 
         self.score = new_track.score
+        self._record_center(frame_id)
+        self._apply_window_velocity()
 
         if new_track.curr_feat is not None:
             self.update_features(new_track.curr_feat)
@@ -112,12 +148,16 @@ class STrack(BaseTrack):
         """Get current position in bounding box format `(top left x, top left y,
                 width, height)`.
         """
+        if self.use_external_motion:
+            return self._tlwh.copy()
         if self.mean is None:
             return self._tlwh.copy()
-        ret = self.mean[:4].copy()
-        ret[2] *= ret[3]
-        ret[:2] -= ret[2:] / 2
-        return ret
+        x = self.mean[0]
+        y = self.mean[1]
+        r = self.mean[6]
+        h = self.mean[7]
+        w = r * h
+        return np.asarray([x - w / 2, y - h / 2, w, h], dtype=float)
 
     @property
     # @jit(nopython=True)
@@ -141,7 +181,11 @@ class STrack(BaseTrack):
         return ret
 
     def to_xyah(self):
-        return self.tlwh_to_xyah(self.tlwh)
+        measurement = self.tlwh_to_xyah(self._tlwh)
+        if self.use_external_motion and self.motion_xy is not None:
+            measurement[0] = self.motion_xy[0]
+            measurement[1] = self.motion_xy[1]
+        return measurement
 
     @staticmethod
     # @jit(nopython=True)
@@ -173,6 +217,61 @@ class BYTETracker(object):
         self.buffer_size = int(frame_rate / 30.0 * args.track_buffer)
         self.max_time_lost = self.buffer_size
         self.kalman_filter = KalmanFilter()
+        self.ground_homography = self._load_ground_homography(args)
+
+    @staticmethod
+    def _resolve_ground_homography_path(args):
+        homography_path = getattr(args, "ground_homography", "")
+        if getattr(args, "disable_ground_motion", False):
+            return ""
+        if homography_path in {"", "none", "None", None}:
+            return ""
+        if homography_path != "auto":
+            return homography_path
+
+        video_path = osp.basename(str(getattr(args, "path", ""))).lower()
+        calibration_dir = "Camera_calibration"
+        if "center" in video_path:
+            preferred = osp.join(calibration_dir, "H_center_to_ground_50pts.txt")
+            fallback = osp.join(calibration_dir, "H_center_to_ground.txt")
+            return preferred if osp.exists(preferred) else fallback
+        if "left" in video_path:
+            preferred = osp.join(calibration_dir, "H_left_to_ground_50pts.txt")
+            fallback = osp.join(calibration_dir, "H_left_to_ground.txt")
+            return preferred if osp.exists(preferred) else fallback
+        return ""
+
+    def _load_ground_homography(self, args):
+        homography_path = self._resolve_ground_homography_path(args)
+        if not homography_path:
+            return None
+        if not osp.exists(homography_path):
+            raise FileNotFoundError(f"Ground homography file not found: {homography_path}")
+        matrix = np.loadtxt(homography_path, dtype=float)
+        if matrix.shape != (3, 3):
+            raise ValueError(f"Ground homography must be 3x3: {homography_path}")
+        print(f"Using ground homography for motion model: {homography_path}")
+        return matrix
+
+    def _project_bottom_centers_to_ground(self, tlbrs):
+        if self.ground_homography is None or len(tlbrs) == 0:
+            return [None] * len(tlbrs)
+
+        tlbrs = np.asarray(tlbrs, dtype=float)
+        bottom_centers = np.stack(
+            [
+                (tlbrs[:, 0] + tlbrs[:, 2]) * 0.5,
+                tlbrs[:, 3],
+                np.ones(len(tlbrs), dtype=float),
+            ],
+            axis=1,
+        )
+        projected = bottom_centers @ self.ground_homography.T
+        denom = projected[:, 2:3]
+        valid = np.abs(denom[:, 0]) > 1e-8
+        ground_points = np.full((len(tlbrs), 2), np.nan, dtype=float)
+        ground_points[valid] = projected[valid, :2] / denom[valid]
+        return [point if np.all(np.isfinite(point)) else None for point in ground_points]
 
     def update(self, output_results, img_info, img_size,det_feats = None):
         self.frame_id += 1
@@ -206,13 +305,21 @@ class BYTETracker(object):
         scores_second = scores[inds_second]
         det_feats_keep = det_feats[remain_inds] if det_feats is not None else None
         det_feats_second = det_feats[inds_second] if det_feats is not None else None        
+        ground_points_keep = self._project_bottom_centers_to_ground(dets)
+        ground_points_second = self._project_bottom_centers_to_ground(dets_second)
 
         if len(dets) > 0:
             '''Detections'''
             if det_feats_keep is None:
-                detections = [STrack(STrack.tlbr_to_tlwh(tlbr), s) for tlbr, s in zip(dets, scores_keep)]
+                detections = [
+                    STrack(STrack.tlbr_to_tlwh(tlbr), s, motion_xy=motion_xy)
+                    for tlbr, s, motion_xy in zip(dets, scores_keep, ground_points_keep)
+                ]
             else:
-                detections = [STrack(STrack.tlbr_to_tlwh(tlbr), s, feat=f) for tlbr, s, f in zip(dets, scores_keep, det_feats_keep)]
+                detections = [
+                    STrack(STrack.tlbr_to_tlwh(tlbr), s, feat=f, motion_xy=motion_xy)
+                    for tlbr, s, f, motion_xy in zip(dets, scores_keep, det_feats_keep, ground_points_keep)
+                ]
         else:
             detections = []
 
@@ -234,10 +341,15 @@ class BYTETracker(object):
             detections,
             match_thresh=self.args.match_thresh,
             kf=self.kalman_filter,
-            maha_thresh=getattr(self.args, "maha_thresh", 100.0),
+            maha_thresh=getattr(self.args, "maha_thresh", None),
+            maha_thresh_roi=getattr(self.args, "maha_thresh_roi", None),
+            maha_roi_polygon=getattr(self.args, "maha_roi_polygon", None),
+            use_maha_gate=getattr(self.args, "use_maha_gate", True),
             only_position=True,
             mot20=self.args.mot20,
             use_fuse_score_on_iou=True,
+            frame_id=self.frame_id,
+            velocity_min_speed=getattr(self.args, "velocity_min_speed", 1.0),
         )
 
         for itracked, idet in matches:
@@ -255,9 +367,15 @@ class BYTETracker(object):
         if len(dets_second) > 0:
             '''Detections'''
             if det_feats_second is None:
-                detections_second = [STrack(STrack.tlbr_to_tlwh(tlbr), s) for tlbr, s in zip(dets_second, scores_second)]
+                detections_second = [
+                    STrack(STrack.tlbr_to_tlwh(tlbr), s, motion_xy=motion_xy)
+                    for tlbr, s, motion_xy in zip(dets_second, scores_second, ground_points_second)
+                ]
             else:
-                detections_second = [STrack(STrack.tlbr_to_tlwh(tlbr), s, feat=f) for tlbr, s, f in zip(dets_second, scores_second, det_feats_second)]
+                detections_second = [
+                    STrack(STrack.tlbr_to_tlwh(tlbr), s, feat=f, motion_xy=motion_xy)
+                    for tlbr, s, f, motion_xy in zip(dets_second, scores_second, det_feats_second, ground_points_second)
+                ]
         else:
             detections_second = []
         r_tracked_stracks = [strack_pool[i] for i in u_track if strack_pool[i].state == TrackState.Tracked]
@@ -267,10 +385,15 @@ class BYTETracker(object):
             detections_second,
             match_thresh=match_thresh_low,
             kf=self.kalman_filter,
-            maha_thresh=getattr(self.args, "maha_thresh", 100.0),
+            maha_thresh=getattr(self.args, "maha_thresh", None),
+            maha_thresh_roi=getattr(self.args, "maha_thresh_roi", None),
+            maha_roi_polygon=getattr(self.args, "maha_roi_polygon", None),
+            use_maha_gate=getattr(self.args, "use_maha_gate", True),
             only_position=True,
             mot20=self.args.mot20,
             use_fuse_score_on_iou=False,
+            frame_id=self.frame_id,
+            velocity_min_speed=getattr(self.args, "velocity_min_speed", 1.0),
         )
         for itracked, idet in matches:
             track = r_tracked_stracks[itracked]
@@ -295,10 +418,15 @@ class BYTETracker(object):
             detections,
             match_thresh=self.args.match_thresh,
             kf=self.kalman_filter,
-            maha_thresh=getattr(self.args, "maha_thresh", 100.0),
+            maha_thresh=getattr(self.args, "maha_thresh", None),
+            maha_thresh_roi=getattr(self.args, "maha_thresh_roi", None),
+            maha_roi_polygon=getattr(self.args, "maha_roi_polygon", None),
+            use_maha_gate=getattr(self.args, "use_maha_gate", True),
             only_position=True,
             mot20=self.args.mot20,
             use_fuse_score_on_iou=True,
+            frame_id=self.frame_id,
+            velocity_min_speed=getattr(self.args, "velocity_min_speed", 1.0),
         )
         for itracked, idet in matches:
             unconfirmed[itracked].update(detections[idet], self.frame_id)

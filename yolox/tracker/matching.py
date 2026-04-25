@@ -226,19 +226,152 @@ def mahalanobis_distance(kf, tracks, detections, only_position=True):
     return dists
 
 
+def velocity_distance(tracks, detections, frame_id=None, min_speed=1.0):
+    """
+    Compare a track's smoothed KF velocity with the velocity implied by assigning
+    a candidate detection to that track in the ground-view plane.
+
+    If either side lacks reliable ground motion, the velocity cost is neutral
+    (0.0) so appearance can decide instead of forcing noisy low-speed direction.
+    """
+    if len(tracks) == 0 or len(detections) == 0:
+        return np.zeros((len(tracks), len(detections)), dtype=float)
+
+    eps = 1e-6
+    min_speed = max(float(min_speed), 0.0)
+    dists = np.zeros((len(tracks), len(detections)), dtype=float)
+
+    for row, track in enumerate(tracks):
+        if track.mean is None or not getattr(track, "center_history", None):
+            continue
+
+        v_track = np.asarray(track.mean[2:4], dtype=float)
+        speed_track = float(np.linalg.norm(v_track))
+        if speed_track < min_speed:
+            continue
+
+        last_frame, last_x, last_y = track.center_history[-1]
+        curr_frame = frame_id if frame_id is not None else int(last_frame) + 1
+        dt = max(int(curr_frame - int(last_frame)), 1)
+        last_pos = np.asarray([last_x, last_y], dtype=float)
+
+        for col, det in enumerate(detections):
+            det_pos = getattr(det, "motion_xy", None)
+            if det_pos is None:
+                continue
+
+            v_candidate = (np.asarray(det_pos, dtype=float) - last_pos) / float(dt)
+            speed_candidate = float(np.linalg.norm(v_candidate))
+
+            speed_cost = abs(speed_candidate - speed_track) / (speed_candidate + speed_track + eps)
+            direction_cost = 0.0
+            if speed_candidate >= min_speed:
+                cos_sim = float(np.dot(v_track, v_candidate) / (speed_track * speed_candidate + eps))
+                cos_sim = np.clip(cos_sim, -1.0, 1.0)
+                direction_cost = (1.0 - cos_sim) * 0.5
+
+            dists[row, col] = np.clip(0.6 * direction_cost + 0.4 * speed_cost, 0.0, 1.0)
+
+    return dists
+
+
+def normalized_position_distance(kf, tracks, detections, maha_thresh, maha_thresh_roi=None, maha_roi_polygon=None, only_position=True):
+    """Return Mahalanobis position cost normalized to [0, 1]."""
+    if kf is None or maha_thresh is None or maha_thresh <= 0:
+        return np.zeros((len(tracks), len(detections)), dtype=float)
+    if len(tracks) == 0 or len(detections) == 0:
+        return np.zeros((len(tracks), len(detections)), dtype=float)
+
+    maha_dists = mahalanobis_distance(kf, tracks, detections, only_position=only_position)
+    det_maha_thresh = _build_detection_maha_thresholds(
+        detections,
+        maha_thresh=maha_thresh,
+        maha_thresh_roi=maha_thresh_roi,
+        maha_roi_polygon=maha_roi_polygon,
+    )
+    det_maha_thresh = np.maximum(det_maha_thresh, 1e-6)
+    return np.clip(maha_dists / det_maha_thresh[None, :], 0.0, 1.0)
+
+
+def _parse_polygon(polygon):
+    if polygon is None:
+        return None
+
+    if isinstance(polygon, str):
+        polygon = polygon.strip()
+        if polygon == "":
+            return None
+        points = []
+        for part in polygon.split(";"):
+            part = part.strip()
+            if not part:
+                continue
+            xy = [v.strip() for v in part.split(",")]
+            if len(xy) != 2:
+                continue
+            try:
+                points.append((float(xy[0]), float(xy[1])))
+            except ValueError:
+                continue
+        if len(points) < 3:
+            return None
+        return np.asarray(points, dtype=np.float32)
+
+    arr = np.asarray(polygon, dtype=np.float32)
+    if arr.ndim == 1:
+        if arr.size < 6 or arr.size % 2 != 0:
+            return None
+        arr = arr.reshape(-1, 2)
+    if arr.ndim != 2 or arr.shape[1] != 2 or arr.shape[0] < 3:
+        return None
+    return arr
+
+
+def _build_detection_maha_thresholds(detections, maha_thresh, maha_thresh_roi=None, maha_roi_polygon=None):
+    det_count = len(detections)
+    if det_count == 0:
+        return np.zeros((0,), dtype=np.float32)
+
+    base = float(maha_thresh)
+    det_thresh = np.full((det_count,), base, dtype=np.float32)
+    if maha_thresh_roi is None:
+        return det_thresh
+
+    roi_val = float(maha_thresh_roi)
+    if roi_val <= 0:
+        return det_thresh
+
+    polygon = _parse_polygon(maha_roi_polygon)
+    if polygon is None:
+        return det_thresh
+
+    for i, det in enumerate(detections):
+        tlwh = det.tlwh
+        cx = float(tlwh[0] + 0.5 * tlwh[2])
+        cy = float(tlwh[1] + 0.5 * tlwh[3])
+        if cv2.pointPolygonTest(polygon, (cx, cy), False) >= 0:
+            det_thresh[i] = roi_val
+    return det_thresh
+
+
 def associate_tracks_detections(
     tracks,
     detections,
     match_thresh,
     kf=None,
-    maha_thresh=100.0,
+    maha_thresh=None,
+    maha_thresh_roi=None,
+    maha_roi_polygon=None,
+    use_maha_gate=True,
     only_position=True,
     mot20=False,
     use_fuse_score_on_iou=True,
+    frame_id=None,
+    velocity_min_speed=1.0,
 ):
     """
     Unified association entry:
-    1) ReID (if features available) + optional KF Mahalanobis gate
+    1) ReID (if features available) + ground-plane velocity consistency
     2) Otherwise IoU distance (+ optional score fusion)
     3) Hungarian assignment with threshold
     """
@@ -250,10 +383,33 @@ def associate_tracks_detections(
     )
 
     if use_reid:
-        dists = embedding_distance(tracks, detections)
-        if kf is not None and maha_thresh is not None and maha_thresh > 0:
+        reid_dists = np.clip(embedding_distance(tracks, detections), 0.0, 1.0)
+        velocity_dists = velocity_distance(
+            tracks,
+            detections,
+            frame_id=frame_id,
+            min_speed=velocity_min_speed,
+        )
+        position_dists = normalized_position_distance(
+            kf,
+            tracks,
+            detections,
+            maha_thresh=maha_thresh,
+            maha_thresh_roi=maha_thresh_roi,
+            maha_roi_polygon=maha_roi_polygon,
+            only_position=only_position,
+        )
+        dists = 0.6 * reid_dists + 0.0 * velocity_dists + 0.4 * position_dists
+        if use_maha_gate and kf is not None and maha_thresh is not None and maha_thresh > 0:
             maha_dists = mahalanobis_distance(kf, tracks, detections, only_position=only_position)
-            dists[maha_dists > maha_thresh] = np.inf
+            det_maha_thresh = _build_detection_maha_thresholds(
+                detections,
+                maha_thresh=maha_thresh,
+                maha_thresh_roi=maha_thresh_roi,
+                maha_roi_polygon=maha_roi_polygon,
+            )
+            invalid = maha_dists > det_maha_thresh[None, :]
+            dists[invalid] = np.inf
     else:
         dists = iou_distance(tracks, detections)
         if use_fuse_score_on_iou and not mot20:
